@@ -1,0 +1,1141 @@
+// Print By Falcon — Prisma schema.
+// Sprint 1: identity, access, rate limiting, audit log, settings, OTP/password-reset,
+// admin invites.
+// Sprint 2: catalog (brands, categories with unlimited nesting per ADR-027, products,
+// product images, printer models, product↔printer compatibility).
+// Sprint 3: FTS searchVector on Product (see lib/catalog/search-vector.ts, ADR-029).
+// Sprint 4: address, cart, minimal inventory + reservations + movements, order
+// + order items + status events, payment plumbing (Paymob card + COD per ADR-030;
+// Fawry via Paymob sub-integration deferred to Sprint 9 per ADR-025).
+// Sprint 5: courier handoff, notifications, cancellation, returns.
+// Sprint 6: inventory polish, invoice metadata (ADR-034), store settings.
+// Sprint 7: B2B — Company, B2BApplication, PricingTier, CompanyPriceOverride.
+// Auth keeps plain Server Actions + Session table per ADR-021 (no Auth.js).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -------------------------------------------------------------------------
+// Identity & Access
+// -------------------------------------------------------------------------
+
+enum UserType {
+  B2C
+  B2B
+  ADMIN
+}
+
+enum AdminRole {
+  OWNER
+  OPS
+  SALES_REP
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum Locale {
+  AR
+  EN
+}
+
+model User {
+  id                 String     @id @default(cuid())
+  type               UserType
+  name               String
+  phone              String?    @unique
+  email              String?    @unique
+  passwordHash       String? // null for B2C (OTP-only)
+  adminRole          AdminRole? // only for type=ADMIN
+  status             UserStatus @default(ACTIVE)
+  languagePref       Locale     @default(AR)
+  mustChangePassword Boolean    @default(false)
+  lastLoginAt        DateTime?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+
+  sessions          Session[]
+  passwordResets    PasswordReset[]
+  auditLogs         AuditLog[]      @relation("ActorAuditLogs")
+  addresses         Address[]       @relation("UserAddresses")
+  cart              Cart?           @relation("UserCart")
+  orders            Order[]         @relation("UserOrders")
+  notifications     Notification[]  @relation("UserNotifications")
+  authoredReturns   Return[]        @relation("ReturnAuthor")
+  generatedInvoices Invoice[]       @relation("InvoiceAuthor")
+
+  // B2B (Sprint 7): the shared company login is the primaryUser; reverse side
+  // is optional (null for B2C / ADMIN / unapproved applicants).
+  companyOwned Company?         @relation("CompanyPrimaryUser")
+  b2bReviews   B2BApplication[] @relation("B2BApplicationReviewer")
+
+  @@index([type, status])
+}
+
+model Session {
+  id          String   @id @default(cuid())
+  token       String   @unique // hashed; the raw token lives only in the cookie
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceLabel String?
+  ipAddress   String?
+  userAgent   String?
+  expiresAt   DateTime
+  lastSeenAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model WhatsAppOtp {
+  id        String    @id @default(cuid())
+  phone     String
+  codeHash  String // SHA-256 of the 6-digit code
+  attempts  Int       @default(0)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([phone, createdAt])
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model AdminInvite {
+  id          String    @id @default(cuid())
+  email       String    @unique
+  role        AdminRole
+  invitedById String
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([invitedById])
+}
+
+// -------------------------------------------------------------------------
+// Rate limiting — DB-backed sliding window (Sprint 1)
+// -------------------------------------------------------------------------
+
+model RateLimit {
+  id          String   @id @default(cuid())
+  // composite key, e.g. "otp-request:+201116527773" or "b2b-login:user@x.com"
+  key         String
+  windowStart DateTime
+  count       Int      @default(1)
+  createdAt   DateTime @default(now())
+
+  @@unique([key, windowStart])
+  @@index([key, windowStart])
+}
+
+// -------------------------------------------------------------------------
+// Settings — flexible KV, JSON-valued
+// -------------------------------------------------------------------------
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+// -------------------------------------------------------------------------
+// Catalog (Sprint 2) — brands, categories, products, images, printer models,
+// and product↔printer compatibility. See docs/architecture.md §5.2 and
+// docs/decisions.md ADR-027 (unlimited category nesting).
+// -------------------------------------------------------------------------
+
+enum Authenticity {
+  GENUINE
+  COMPATIBLE
+}
+
+// Shared active/archived status for catalog entities. Archived rows stay in
+// the DB (preserve audit + existing references) but are hidden from the
+// public storefront. Hard delete only allowed when no dependent rows exist.
+enum CatalogStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model Brand {
+  id        String        @id @default(cuid())
+  nameAr    String
+  nameEn    String
+  slug      String        @unique
+  status    CatalogStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  products      Product[]
+  printerModels PrinterModel[]
+
+  @@index([status])
+}
+
+model Category {
+  id        String        @id @default(cuid())
+  parentId  String?
+  parent    Category?     @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children  Category[]    @relation("CategoryTree")
+  nameAr    String
+  nameEn    String
+  slug      String        @unique
+  position  Int           @default(0)
+  status    CatalogStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  products Product[]
+
+  @@index([parentId, position])
+  @@index([status])
+}
+
+model Product {
+  id            String                   @id @default(cuid())
+  sku           String                   @unique
+  brandId       String
+  brand         Brand                    @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  categoryId    String
+  category      Category                 @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  slug          String                   @unique
+  nameAr        String
+  nameEn        String
+  descriptionAr String                   @db.Text
+  descriptionEn String                   @db.Text
+  // free-form key/value bag: `{ "printSpeed": "35 ppm", "pageYield": 3000 }`.
+  // Shape isn't enforced at DB level; admin UI provides a key/value editor.
+  specs         Json                     @default("{}")
+  basePriceEgp  Decimal                  @db.Decimal(10, 2)
+  vatExempt     Boolean                  @default(false)
+  /// Per-product return eligibility (Sprint 10). Admin toggles in product form.
+  /// When false, no return can list this SKU regardless of the global policy.
+  returnable    Boolean                  @default(true)
+  authenticity  Authenticity             @default(GENUINE)
+  status        CatalogStatus            @default(ACTIVE)
+  // Full-text search vector — populated by `lib/catalog/search-vector.ts` on
+  // product create/update + brand rename. GIN index added by scripts/post-push.ts
+  // (db push doesn't emit indexes on Unsupported types).
+  searchVector  Unsupported("tsvector")?
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+
+  images                ProductImage[]
+  compatibilities       ProductCompatibility[]
+  inventory             Inventory?
+  inventoryReservations InventoryReservation[]
+  inventoryMovements    InventoryMovement[]
+  cartItems             CartItem[]
+  orderItems            OrderItem[]
+  priceOverrides        CompanyPriceOverride[]
+
+  @@index([brandId])
+  @@index([categoryId])
+  @@index([status])
+  @@index([authenticity])
+}
+
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  // canonical filename stem (cuid); on disk three variants exist:
+  //   /storage/products/{productId}/thumb-{filename}.webp     (200px)
+  //   /storage/products/{productId}/medium-{filename}.webp    (800px)
+  //   /storage/products/{productId}/original-{filename}.webp  (max 1600px)
+  filename  String
+  position  Int      @default(0)
+  altAr     String?
+  altEn     String?
+  createdAt DateTime @default(now())
+
+  @@index([productId, position])
+}
+
+model PrinterModel {
+  id        String        @id @default(cuid())
+  brandId   String
+  brand     Brand         @relation(fields: [brandId], references: [id], onDelete: Restrict)
+  modelName String
+  slug      String        @unique
+  status    CatalogStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  compatibilities ProductCompatibility[]
+
+  @@unique([brandId, modelName])
+  @@index([status])
+}
+
+model ProductCompatibility {
+  productId      String
+  product        Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  printerModelId String
+  printerModel   PrinterModel @relation(fields: [printerModelId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
+
+  @@id([productId, printerModelId])
+  @@index([printerModelId])
+}
+
+// -------------------------------------------------------------------------
+// Geography & shipping (Sprint 4 — Address; ShippingZone / Courier in S5–S9)
+// -------------------------------------------------------------------------
+
+/// Egyptian governorates (27). Used on Address.governorate and later on
+/// GovernorateZone mapping (Sprint 9). Stored as enum so typos at the UI layer
+/// can't leak into the DB.
+enum Governorate {
+  CAIRO
+  GIZA
+  QALYUBIA
+  ALEXANDRIA
+  BEHEIRA
+  DAKAHLIA
+  DAMIETTA
+  GHARBIA
+  KAFR_EL_SHEIKH
+  MENOUFIA
+  SHARQIA
+  ISMAILIA
+  PORT_SAID
+  SUEZ
+  NORTH_SINAI
+  SOUTH_SINAI
+  RED_SEA
+  MATRUH
+  NEW_VALLEY
+  BENI_SUEF
+  FAYOUM
+  MINYA
+  ASYUT
+  SOHAG
+  QENA
+  LUXOR
+  ASWAN
+}
+
+model Address {
+  id            String      @id @default(cuid())
+  userId        String?
+  user          User?       @relation("UserAddresses", fields: [userId], references: [id], onDelete: Cascade)
+  // Recipient info — snapshot to allow guest checkout without a User row.
+  recipientName String
+  phone         String
+  governorate   Governorate
+  city          String
+  area          String?
+  street        String
+  building      String?
+  apartment     String?
+  notes         String?
+  isDefault     Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([userId, isDefault])
+}
+
+// -------------------------------------------------------------------------
+// Shipping zones (Sprint 9 S9-D1-T1) — 5 zones per PRD §5 Feature 3.
+// Admin-editable rates, free-shipping thresholds, COD-enabled per zone.
+// `code` is the stable enum-like key used by app code + seeds; UI uses the
+// bilingual names. `baseRateEgp` is the default; a zone with rate 0 = free.
+// `codEnabled` lets the owner turn off COD in remote zones without touching
+// the global COD policy.
+// -------------------------------------------------------------------------
+
+/// Sprint 11.5 — `code` is now a free-text unique slug (was an enum). The 5
+/// seed zones keep their original codes (GREATER_CAIRO etc.) for stability;
+/// admin-created zones get auto-generated slugs from the English name. Code
+/// is only used as a stable key for audit logs + post-push idempotency; the
+/// admin UI displays `nameAr` / `nameEn`.
+
+model ShippingZone {
+  id                          String   @id @default(cuid())
+  code                        String   @unique
+  nameAr                      String
+  nameEn                      String
+  baseRateEgp                 Decimal  @db.Decimal(10, 2)
+  freeShippingThresholdB2cEgp Decimal? @db.Decimal(10, 2)
+  freeShippingThresholdB2bEgp Decimal? @db.Decimal(10, 2)
+  codEnabled                  Boolean  @default(true)
+  position                    Int      @default(0)
+  /// Sprint 11.5 — soft-archive flag. When `false`, zone is hidden from new
+  /// shipping quotes but historical orders + governorate mappings stay intact.
+  /// `code` is enum-typed so we can't truly delete; deactivation is the
+  /// admin-equivalent of "remove zone".
+  active                      Boolean  @default(true)
+  /// Sprint 11.5 — estimated delivery window shown to customer at checkout
+  /// + on order detail. Min/Max in working days. Defaults are middle-of-the-
+  /// pack; admin tunes per zone.
+  estimatedDeliveryDaysMin    Int      @default(2)
+  estimatedDeliveryDaysMax    Int      @default(5)
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+
+  /// LEGACY — Sprint 9 mapping table. Kept for backward compat with
+  /// `lib/shipping/resolve.ts` during Sprint 11.5 transition. New code reads
+  /// the relation below (`governorateConfigs`). Removed in Sprint 12+.
+  governorates       GovernorateZone[]
+  /// Sprint 11.5 — admin-editable governorate rows linked to this zone.
+  governorateConfigs GovernorateConfig[] @relation("ZoneGovernorateConfigs")
+
+  @@index([position])
+  @@index([active])
+}
+
+/// Governorate → ShippingZone mapping. One row per governorate (PK on
+/// governorate). Seeded with the plain-reading PRD mapping; admin can
+/// reassign via /admin/settings/shipping.
+///
+/// LEGACY (Sprint 11.5) — superseded by `GovernorateConfig.zoneId`. Kept
+/// in lock-step with `GovernorateConfig` by `post-push.ts` so reader code
+/// (currently `lib/shipping/resolve.ts`) keeps working until Sprint 12
+/// migrates the reads. Do not introduce new readers.
+model GovernorateZone {
+  governorate Governorate  @id
+  zoneId      String
+  zone        ShippingZone @relation(fields: [zoneId], references: [id], onDelete: Restrict)
+  updatedAt   DateTime     @updatedAt
+
+  @@index([zoneId])
+}
+
+/// Sprint 11.5 — admin-editable per-governorate config. Uses the existing
+/// `Governorate` enum as the natural key (`code`); admin can edit name +
+/// `deliverable` toggle (block checkout to this governorate) + reassign to
+/// a different `ShippingZone` + reorder via `position`. Pre-seeded with all
+/// 27 enum values via `post-push.ts`; admin "delete" is a soft-delete via
+/// `deliverable=false` since the enum guarantees a finite set of codes.
+/// Adding a 28th governorate (rare — Egyptian govt rarely creates new ones)
+/// requires extending the `Governorate` enum + redeploy.
+model GovernorateConfig {
+  code        Governorate   @id
+  nameAr      String
+  nameEn      String
+  deliverable Boolean       @default(true)
+  position    Int           @default(0)
+  zoneId      String?
+  zone        ShippingZone? @relation("ZoneGovernorateConfigs", fields: [zoneId], references: [id], onDelete: SetNull)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([zoneId])
+  @@index([deliverable, position])
+}
+
+// -------------------------------------------------------------------------
+// Payment methods (Sprint 11.5) — admin-toggled list of which payment
+// surfaces show up in checkout. Keys + secrets stay in env (per ADR-056);
+// this table only controls visibility + display labels. The mode (LIVE vs
+// TEST) lives in `Setting payment.mode` and switches which env-var pair the
+// Paymob lib reads at request time.
+// -------------------------------------------------------------------------
+
+model PaymentMethodConfig {
+  /// Stable code: 'paymob_card' / 'paymob_fawry' / 'paymob_wallet' / 'cod'.
+  code          String   @id
+  enabled       Boolean  @default(false)
+  nameAr        String
+  nameEn        String
+  descriptionAr String?
+  descriptionEn String?
+  position      Int      @default(0)
+  /// For Paymob methods: maps to PAYMOB_INTEGRATION_ID_<KIND> env var.
+  /// 'card' / 'fawry' / 'wallet'. Null for non-Paymob methods (e.g., cod).
+  paymobIntegrationKind String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([enabled, position])
+}
+
+// -------------------------------------------------------------------------
+// Promo codes (Sprint 9 S9-D5-T1) — basic discount codes per PRD §5
+// Feature 3. MVP limits: one code per order, % or fixed value, min-order
+// gate, total-usage cap, date window, active toggle.
+// -------------------------------------------------------------------------
+
+enum PromoCodeType {
+  PERCENT
+  FIXED
+}
+
+model PromoCode {
+  id             String        @id @default(cuid())
+  code           String        @unique
+  type           PromoCodeType
+  /// PERCENT: integer 1-100. FIXED: EGP amount as Decimal.
+  value          Decimal       @db.Decimal(10, 2)
+  minOrderEgp    Decimal?      @db.Decimal(10, 2)
+  /// Optional EGP ceiling on the resulting discount. Mostly useful for
+  /// PERCENT codes (prevents a 10% code from giving 2,895 EGP off a 28k
+  /// order). When null → no cap. FIXED codes can also set this as a
+  /// redundant safety net, but the FIXED value already caps itself.
+  maxDiscountEgp Decimal?      @db.Decimal(10, 2)
+  usageLimit     Int?
+  usedCount      Int           @default(0)
+  validFrom      DateTime?
+  validTo        DateTime?
+  active         Boolean       @default(true)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  orders Order[]
+
+  @@index([active, validFrom, validTo])
+}
+
+// -------------------------------------------------------------------------
+// Cart (Sprint 4 — session-based for guests, user-based for logged-in B2C)
+// -------------------------------------------------------------------------
+
+model Cart {
+  id         String    @id @default(cuid())
+  userId     String?   @unique
+  user       User?     @relation("UserCart", fields: [userId], references: [id], onDelete: Cascade)
+  sessionKey String?   @unique // for guest carts; migrated to userId on sign-in
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  items CartItem[]
+}
+
+model CartItem {
+  id                   String   @id @default(cuid())
+  cartId               String
+  cart                 Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId            String
+  product              Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  qty                  Int
+  unitPriceEgpSnapshot Decimal  @db.Decimal(10, 2)
+  addedAt              DateTime @default(now())
+
+  @@unique([cartId, productId])
+  @@index([cartId])
+}
+
+// -------------------------------------------------------------------------
+// Inventory (Sprint 4 — minimal placeholder; S6 extends with full features)
+// -------------------------------------------------------------------------
+
+enum InventoryReservationType {
+  CART // 15-min TTL soft hold
+  ORDER // firm hold until order terminal state
+}
+
+enum InventoryMovementType {
+  RECEIVE
+  SALE
+  ADJUST
+  RETURN
+  RESERVATION_RELEASE
+}
+
+model Inventory {
+  productId         String   @id
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  currentQty        Int      @default(0)
+  lowStockThreshold Int?
+  updatedAt         DateTime @updatedAt
+}
+
+model InventoryReservation {
+  id        String                   @id @default(cuid())
+  type      InventoryReservationType
+  productId String
+  product   Product                  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  // CART reservations: refId = CartItem.id. ORDER reservations: refId = OrderItem.id.
+  refId     String
+  qty       Int
+  expiresAt DateTime? // null for ORDER-type (until terminal state)
+  createdAt DateTime                 @default(now())
+
+  @@index([productId, expiresAt])
+  @@index([refId])
+  @@index([type, expiresAt])
+}
+
+model InventoryMovement {
+  id        String                @id @default(cuid())
+  productId String
+  product   Product               @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type      InventoryMovementType
+  qtyDelta  Int // positive for RECEIVE/RETURN, negative for SALE/ADJUST-down
+  reason    String?
+  refId     String? // order_id, adjustment_id, etc.
+  actorId   String?
+  createdAt DateTime              @default(now())
+
+  @@index([productId, createdAt])
+}
+
+// -------------------------------------------------------------------------
+// Orders (Sprint 4 — B2C happy path; B2B extensions + Company relation in S6+)
+// -------------------------------------------------------------------------
+
+enum OrderType {
+  B2C
+  B2B
+}
+
+enum OrderStatus {
+  PENDING_CONFIRMATION // B2B Submit-for-Review only
+  CONFIRMED
+  HANDED_TO_COURIER
+  OUT_FOR_DELIVERY
+  DELIVERED
+  CANCELLED
+  RETURNED
+  DELAYED_OR_ISSUE
+}
+
+enum PaymentMethod {
+  PAYMOB_CARD
+  PAYMOB_FAWRY // Sprint 9 via Paymob sub-integration
+  COD
+  SUBMIT_FOR_REVIEW // B2B path (S6+)
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PENDING_ON_DELIVERY // COD: payment taken at delivery
+}
+
+model Order {
+  id          String    @id @default(cuid())
+  /// Human-readable ID: `ORD-YY-DDMM-NNNNN` — daily-reset serial per ADR-019.
+  orderNumber String    @unique
+  userId      String?
+  user        User?     @relation("UserOrders", fields: [userId], references: [id], onDelete: SetNull)
+  // B2B: companyId is set whenever the user placing the order is the
+  // primary user of a Company (ADR-007 — one shared login per company).
+  // Null for B2C orders and for B2B users whose company relation is not yet
+  // active (applicants still browsing / checking out via B2C path per PRD
+  // Feature 2 "Pending state"). Used by /b2b/orders to scope history
+  // company-wide instead of per-user.
+  companyId   String?
+  company     Company?  @relation("CompanyOrders", fields: [companyId], references: [id], onDelete: SetNull)
+  type        OrderType @default(B2C)
+
+  // Guest-checkout snapshot fields (also populated for logged-in users for stability).
+  contactName  String
+  contactPhone String
+  contactEmail String?
+
+  // Address snapshot — JSON so the order stays legible even if the Address row later changes.
+  addressSnapshot Json
+
+  status        OrderStatus   @default(CONFIRMED)
+  paymentMethod PaymentMethod
+  paymentStatus PaymentStatus @default(PENDING)
+
+  subtotalEgp Decimal @db.Decimal(10, 2)
+  shippingEgp Decimal @default(0) @db.Decimal(10, 2)
+  // Sprint 9: COD fee tracked separately from shipping so the invoice +
+  // checkout summary can surface it on its own line. Zero for non-COD
+  // orders. Value applied = Setting 'cod.policy' at the moment of
+  // placement (snapshotted via the resolved shipping quote).
+  codFeeEgp   Decimal @default(0) @db.Decimal(10, 2)
+  discountEgp Decimal @default(0) @db.Decimal(10, 2)
+  vatEgp      Decimal @default(0) @db.Decimal(10, 2)
+  totalEgp    Decimal @db.Decimal(10, 2)
+
+  // Sprint 9: applied promo code (nullable — most orders have none). Kept
+  // as a FK so admin can see "which orders used CODE-X" via the relation
+  // + aggregated usedCount stays authoritative on the PromoCode row.
+  promoCodeId String?
+  promoCode   PromoCode? @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
+
+  // Paymob correlation — populated when paymentMethod is a Paymob flow.
+  paymobOrderId       String?
+  paymobTransactionId String? @unique
+
+  // Courier handoff — populated when the order transitions to HANDED_TO_COURIER.
+  courierId            String?
+  courier              Courier?  @relation(fields: [courierId], references: [id], onDelete: SetNull)
+  courierPhoneSnapshot String? // snapshot so the customer-facing page survives courier edits
+  waybill              String?
+  expectedDeliveryDate DateTime?
+
+  internalNotes String?
+  customerNotes String?
+
+  // B2B attribution (Sprint 8 S8-D1-T1). `placedByName` is required at
+  // checkout for B2B Submit-for-Review flows (shared login per ADR-007 —
+  // owner wants to know which employee placed the order). `poReference`
+  // is an optional customer-supplied PO number shown on the invoice.
+  // `paymentMethodNote` is a free-text hint the sales rep fills when
+  // confirming an SFR order (e.g. "Net-15 PO #A12", "Bank transfer") —
+  // keeps PaymentMethod enum stable while surfacing the agreed terms.
+  placedByName      String?
+  poReference       String?
+  paymentMethodNote String?
+
+  // Cancellation request (Sprint 5 S5-D4): customer requests cancel pre-HandedToCourier;
+  // admin approves (→ status=CANCELLED + reservation release) or denies (resolution recorded).
+  // Null `cancellationRequestedAt` = no request ever. `cancellationResolvedAt` null while pending.
+  cancellationRequestedAt    DateTime?
+  cancellationReason         String?
+  cancellationResolvedAt     DateTime?
+  cancellationResolution     CancellationResolution?
+  cancellationResolutionNote String?
+  cancellationResolvedById   String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  confirmedAt DateTime?
+  deliveredAt DateTime?
+
+  items         OrderItem[]
+  statusEvents  OrderStatusEvent[]
+  notifications Notification[]
+  returns       Return[]
+  invoices      Invoice[]
+
+  @@index([userId, createdAt])
+  @@index([companyId, createdAt])
+  @@index([status, createdAt])
+  @@index([paymentMethod, paymentStatus])
+  @@index([createdAt])
+  @@index([courierId])
+  // Fast filter for the admin cancellation queue: pending cancellations
+  // (requested but not resolved). `resolvedAt IS NULL AND requestedAt IS NOT NULL`.
+  @@index([cancellationRequestedAt, cancellationResolvedAt])
+}
+
+enum CancellationResolution {
+  APPROVED
+  DENIED
+}
+
+// ---------------------------------------------------------------------------
+// Returns (Sprint 5 S5-D7-T2)
+// Customer messages via WhatsApp; admin records a Return row here with the
+// decision (per ADR-033 resolution). No self-serve return UI in MVP — the
+// admin types it in, picks the refund path, and the Whats360 message to the
+// customer goes out via the existing notification pipeline.
+// ---------------------------------------------------------------------------
+
+enum RefundDecision {
+  PENDING
+  APPROVED_CASH
+  APPROVED_CARD_MANUAL
+  DENIED
+}
+
+model Return {
+  id              String         @id @default(cuid())
+  orderId         String
+  order           Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  reason          String
+  refundDecision  RefundDecision @default(PENDING)
+  refundAmountEgp Decimal?       @db.Decimal(10, 2)
+  note            String?
+  /// Sprint 10: set when the Return policy was bypassed by an admin.
+  /// When non-null, `overrideReason` is required.
+  policyOverride  Boolean        @default(false)
+  overrideReason  String?
+  /// Sprint 10: set when the stock for this return has been released back into
+  /// inventory. Idempotent — subsequent process attempts skip the release.
+  stockReleasedAt DateTime?
+  createdById     String?
+  createdBy       User?          @relation("ReturnAuthor", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  items ReturnItem[]
+
+  @@index([orderId])
+  @@index([refundDecision, createdAt])
+}
+
+model ReturnItem {
+  id          String    @id @default(cuid())
+  returnId    String
+  return      Return    @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  orderItemId String
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  qty         Int
+
+  @@index([returnId])
+}
+
+model OrderItem {
+  id             String   @id @default(cuid())
+  orderId        String
+  order          Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId      String?
+  product        Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  // Snapshots — preserve line-item details even if the product is later edited/archived.
+  skuSnapshot    String
+  nameArSnapshot String
+  nameEnSnapshot String
+  qty            Int
+  unitPriceEgp   Decimal  @db.Decimal(10, 2)
+  lineTotalEgp   Decimal  @db.Decimal(10, 2)
+  vatEgp         Decimal  @default(0) @db.Decimal(10, 2)
+  createdAt      DateTime @default(now())
+
+  returnItems ReturnItem[]
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model OrderStatusEvent {
+  id        String      @id @default(cuid())
+  orderId   String
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    OrderStatus
+  note      String?
+  actorId   String?
+  createdAt DateTime    @default(now())
+
+  @@index([orderId, createdAt])
+}
+
+/// Per-day order-serial counter — `ORD-YY-DDMM-NNNNN` daily reset (ADR-019).
+/// Row keyed by `YYYYMMDD` int; SERIALIZABLE increment in generateOrderNumber().
+model OrderDailySequence {
+  id         Int      @id // YYYYMMDD
+  lastSerial Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
+
+// -------------------------------------------------------------------------
+// Couriers — admin-editable partner list used at HANDED_TO_COURIER transition.
+// -------------------------------------------------------------------------
+
+model Courier {
+  id        String   @id @default(cuid())
+  nameAr    String
+  nameEn    String
+  phone     String? // default contact line (overridable per-order at handoff)
+  position  Int      @default(0) // sort order in admin dropdowns
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders Order[]
+
+  @@index([active, position])
+}
+
+// -------------------------------------------------------------------------
+// Notifications — append-only send log (worker-managed, Whats360 + SMTP).
+// -------------------------------------------------------------------------
+
+enum NotificationChannel {
+  WHATSAPP
+  EMAIL
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id                String              @id @default(cuid())
+  userId            String?
+  user              User?               @relation("UserNotifications", fields: [userId], references: [id], onDelete: SetNull)
+  channel           NotificationChannel
+  /// Logical template key (e.g. `order.statusChange`, `otp`, `order.confirmed`).
+  template          String
+  /// Rendered payload at enqueue time — phone/email, body text, subject, etc.
+  payload           Json
+  relatedOrderId    String?
+  relatedOrder      Order?              @relation(fields: [relatedOrderId], references: [id], onDelete: SetNull)
+  status            NotificationStatus  @default(PENDING)
+  externalMessageId String? // Whats360 id or SMTP message-id
+  errorMessage      String?
+  createdAt         DateTime            @default(now())
+  sentAt            DateTime?
+
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+  @@index([relatedOrderId])
+  // Sprint 11 — Whats360 inbound webhook calls `notification.updateMany({ where: { externalMessageId } })`
+  // to flip status on delivery-failure events; without this, every inbound
+  // webhook was doing a full table scan.
+  @@index([externalMessageId])
+}
+
+/// Customer-initiated opt-out from automated WhatsApp notifications (Sprint 11 S11-D6-T3).
+///
+/// Triggered when a recipient replies "STOP" / "إلغاء" / "UNSUBSCRIBE" to the
+/// store's WhatsApp number — the Whats360 inbound webhook upserts a row here,
+/// and the `send-whatsapp` worker skips queued Notification rows whose phone
+/// matches. Admin can also record opt-outs via the settings panel (support).
+///
+/// **OTP + auth-critical messages bypass this table** — `issueOtp` calls
+/// `sendWhatsApp` directly without going through the Notification worker, so
+/// opted-out phones can still receive a one-time OTP to sign in / recover.
+///
+/// Stored phone format: E.164 without '+', e.g. `201012345678`. Must match
+/// `normalizeEgyptianPhone()` output for the send-time lookup to hit.
+model NotificationOptOut {
+  id        String       @id @default(cuid())
+  phone     String       @unique
+  source    OptOutSource
+  reason    String?
+  createdAt DateTime     @default(now())
+  createdBy String?
+
+  @@index([createdAt])
+}
+
+enum OptOutSource {
+  WHATSAPP_KEYWORD
+  ADMIN
+  SUPPORT
+}
+
+// -------------------------------------------------------------------------
+// Audit log — append-only
+// -------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("ActorAuditLogs", fields: [actorId], references: [id], onDelete: SetNull)
+  action     String // e.g., "auth.login", "user.create", "order.status_change"
+  entityType String? // e.g., "User", "Order"
+  entityId   String?
+  before     Json?
+  after      Json?
+  note       String?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([action, createdAt])
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
+
+// -------------------------------------------------------------------------
+// Invoicing (Sprint 6 — ADR-034).
+// Invoices are *metadata rows* only. PDFs are rendered on-demand from the
+// immutable Order/OrderItem snapshots; we never write files to disk. Legal
+// retention (5 years per ADR-003) is satisfied by the Invoice row + the
+// deterministic re-render path in lib/invoices/render.ts.
+//
+// Numbering (ADR-020): `INV-YY-NNNNNN` gapless annual serial via
+// InvoiceAnnualSequence (atomic upsert + RETURNING pattern, identical to
+// OrderDailySequence in lib/order/order-number.ts).
+// -------------------------------------------------------------------------
+
+model Invoice {
+  id              String    @id @default(cuid())
+  /// `INV-YY-NNNNNN` — gapless annual serial (ADR-020).
+  invoiceNumber   String    @unique
+  orderId         String
+  order           Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  version         Int       @default(1)
+  /// When > 1, this invoice amends a prior version. The chain walks via amendedFromId.
+  amendedFromId   String?
+  amendedFrom     Invoice?  @relation("InvoiceAmendments", fields: [amendedFromId], references: [id], onDelete: SetNull)
+  amendedBy       Invoice[] @relation("InvoiceAmendments")
+  amendmentReason String?
+  isAmended       Boolean   @default(false)
+  generatedById   String?
+  generatedBy     User?     @relation("InvoiceAuthor", fields: [generatedById], references: [id], onDelete: SetNull)
+  generatedAt     DateTime  @default(now())
+
+  @@index([orderId, version])
+  @@index([generatedAt])
+}
+
+/// Gapless annual invoice-number counter (ADR-020). Row keyed by YY (e.g., 26).
+model InvoiceAnnualSequence {
+  year       Int      @id // last two digits of the year, e.g., 26
+  lastSerial Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
+
+// -------------------------------------------------------------------------
+// B2B (Sprint 7) — Company accounts, admin-approval pipeline, pricing tiers.
+// See PRD Feature 2 + Feature 4, architecture §5.3, ADR-005/006/007/016.
+//
+// Flow:
+//   1. Applicant submits B2BApplication via /b2b/register. No User row yet.
+//   2. Admin approves → we create User (type=B2B, mustChangePassword=true)
+//      + Company (links to PricingTier + optional per-SKU overrides) in one
+//      transaction, email temp password.
+//   3. Admin rejects → application row marked REJECTED with a reason;
+//      email + CR# stay free for resubmission (Design A, Sprint 7 kickoff).
+// -------------------------------------------------------------------------
+
+enum CompanyStatus {
+  /// Accepted via admin approval. Normal operating state.
+  ACTIVE
+  /// Temporarily disabled by admin (credit issue, policy breach, etc.).
+  /// User can't log in; historical orders remain for audit.
+  SUSPENDED
+}
+
+enum CreditTerms {
+  /// Pay on placement — no credit extended. Default for new accounts.
+  NONE
+  NET_15
+  NET_30
+  /// Admin sets a specific creditLimitEgp; terms documented separately.
+  CUSTOM
+}
+
+enum PricingTierCode {
+  A // default 10% off base price
+  B // default 15% off base price
+  C // per-SKU overrides only (no blanket discount)
+}
+
+enum B2BApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum B2BCheckoutPolicy {
+  /// Default for new B2B accounts — both "Submit for Review" and "Pay Now"
+  /// visible at checkout (Sprint 8 consumes this field).
+  BOTH
+  SUBMIT_FOR_REVIEW_ONLY
+  PAY_NOW_ONLY
+}
+
+/// Pricing tier. A/B carry a blanket percentage discount applied to base
+/// price; C has no blanket discount — pricing is driven by per-SKU
+/// `CompanyPriceOverride` rows. Defaults seeded by scripts/post-push.ts.
+model PricingTier {
+  id                     String          @id @default(cuid())
+  code                   PricingTierCode @unique
+  nameAr                 String
+  nameEn                 String
+  /// Percent discount off Product.basePriceEgp. Null for tier C (per-SKU only).
+  defaultDiscountPercent Decimal?        @db.Decimal(5, 2)
+  createdAt              DateTime        @default(now())
+  updatedAt              DateTime        @updatedAt
+
+  companies Company[]
+}
+
+/// Company application — system-of-record up to approval. Stores the
+/// applicant's chosen password hash so approval can create the User row
+/// in the same transaction without re-prompting. Rejected applications
+/// are kept for audit but do NOT create User rows (Design A).
+model B2BApplication {
+  id                    String               @id @default(cuid())
+  companyName           String
+  crNumber              String
+  taxCardNumber         String
+  contactName           String
+  phone                 String
+  email                 String
+  /// bcrypt hash of the applicant's password — carried forward to User on approve.
+  passwordHash          String
+  governorate           Governorate
+  /// Free-text city within the governorate (admin can use this + governorate to
+  /// choose the right ShippingZone mapping once Sprint 9 lands).
+  city                  String
+  addressLine           String?
+  /// Free-text like "50,000 EGP/month" — not parsed, shown to admin for context.
+  monthlyVolumeEstimate String?
+  status                B2BApplicationStatus @default(PENDING)
+  reviewerId            String?
+  reviewer              User?                @relation("B2BApplicationReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  reviewedAt            DateTime?
+  /// Rejection reason or approval note.
+  decisionNote          String?
+  /// Set on approval — points at the Company we created so admins can trace
+  /// an application back to its company row.
+  resultingCompanyId    String?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  @@index([status, createdAt])
+  @@index([email])
+  @@index([crNumber])
+}
+
+/// Approved B2B company. One Company has exactly one primaryUser (ADR-007 —
+/// shared login for MVP; multi-user in v1.1). Orders link to Company for
+/// company-wide history.
+model Company {
+  id                    String            @id @default(cuid())
+  nameAr                String
+  nameEn                String?
+  crNumber              String            @unique
+  taxCardNumber         String            @unique
+  status                CompanyStatus     @default(ACTIVE)
+  pricingTierId         String
+  pricingTier           PricingTier       @relation(fields: [pricingTierId], references: [id], onDelete: Restrict)
+  creditTerms           CreditTerms       @default(NONE)
+  creditLimitEgp        Decimal?          @db.Decimal(12, 2)
+  monthlyVolumeEstimate String?
+  /// Default BOTH — Sprint 8 uses this to control checkout options per company.
+  checkoutPolicy        B2BCheckoutPolicy @default(BOTH)
+  /// Shared login (ADR-007). Exactly one User per Company in MVP.
+  primaryUserId         String            @unique
+  primaryUser           User              @relation("CompanyPrimaryUser", fields: [primaryUserId], references: [id], onDelete: Cascade)
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  priceOverrides CompanyPriceOverride[]
+  orders         Order[]                @relation("CompanyOrders")
+
+  @@index([status])
+  @@index([pricingTierId])
+}
+
+/// Per-SKU price override for a company. Wins over the blanket tier discount
+/// during pricing resolution (lib/pricing/resolve.ts). Used primarily for
+/// tier C companies where pricing is negotiated line-by-line, but valid for
+/// any tier (an A/B company can still carry an override on a single SKU).
+model CompanyPriceOverride {
+  id             String   @id @default(cuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// The negotiated price in EGP — replaces `basePriceEgp - tierDiscount` entirely.
+  customPriceEgp Decimal  @db.Decimal(10, 2)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([companyId, productId])
+  @@index([productId])
+}

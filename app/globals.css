@@ -1,0 +1,138 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────────────
+   Design tokens — Print By Falcon
+   All colors in HSL so shadcn utilities work. Hex in comments for reference.
+   See docs/design-system.md for the full token catalog + rationale.
+   ───────────────────────────────────────────────────────────────────── */
+@layer base {
+  :root {
+    /* Surfaces — Sprint 11 UI refiner v2 (ADR-059): pure white body, neutral-gray panels.
+       Replaces ADR-031's warm cream palette (Canvas #FAFAF7 + Paper #F3F1EC). */
+    --canvas: 0 0% 100%; /* #FFFFFF  page background  */
+    --paper: 0 0% 97%; /* #F7F7F7  card surface     */
+    --paper-hover: 0 0% 94%; /* #F0F0F0  card hover       */
+
+    /* Text */
+    --ink: 222 47% 11%; /* #0F172A  primary text + primary bar / footer bg */
+    --ink-2: 215 28% 17%; /* #1F2937  secondary ink, hover, footer copyright row */
+    --muted-bg: 0 0% 97%; /* matches paper             */
+    --muted-fg: 0 0% 40%; /* #666666  secondary text (AA 5.7:1 on white) */
+
+    /* Borders — neutral grays (no warm tint) */
+    --border: 0 0% 90%; /* #E5E5E5  dividers         */
+    --border-strong: 0 0% 50%; /* #808080  inputs, UI-AA    */
+
+    /* Accent — ink-cyan */
+    --accent: 185 81% 29%; /* #0E7C86  CTAs, active     */
+    --accent-strong: 185 84% 25%; /* #0A6B74  links, hover     */
+    --accent-soft: 184 39% 93%; /* #E6F3F4  tinted bg        */
+
+    /* Semantic — all body-text-safe on canvas (AA ≥ 4.5:1) */
+    --success: 142 44% 33%; /* #2F7A4B  */
+    --success-soft: 138 32% 92%; /* #E4F1E8  */
+    --warning: 36 63% 34%; /* #8F6320  */
+    --warning-soft: 41 58% 91%; /* #F5ECD9  */
+    --error: 0 44% 49%; /* #B54747  */
+    --error-soft: 0 48% 92%; /* #F4E0E0  */
+
+    /* Radii mirrored in tailwind.config.ts */
+    --radius: 0.5rem;
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-xl: 16px;
+
+    /* Motion */
+    --ease-out-smooth: cubic-bezier(0.2, 0.7, 0.3, 1);
+    --duration-fast: 120ms;
+    --duration-base: 180ms;
+    --duration-slow: 280ms;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  html[dir='ltr'] body {
+    font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  }
+  html[dir='rtl'] body {
+    font-family:
+      var(--font-arabic), var(--font-sans), ui-sans-serif, sans-serif;
+  }
+
+  :focus-visible {
+    outline: 2px solid hsl(var(--accent));
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  /* Keep numerals LTR inside RTL text (prices, SKUs, order IDs) */
+  [dir='rtl'] .num,
+  [dir='rtl'] [data-num] {
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+
+  ::selection {
+    background-color: hsl(var(--accent-soft));
+    color: hsl(var(--ink));
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 1ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 1ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  .container-page {
+    @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8;
+  }
+
+  .hairline {
+    box-shadow: inset 0 -1px 0 hsl(var(--border));
+  }
+
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--paper)) 0%,
+      hsl(var(--paper-hover)) 50%,
+      hsl(var(--paper)) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
+  }
+  @keyframes shimmer {
+    0% {
+      background-position: 200% 0;
+    }
+    100% {
+      background-position: -200% 0;
+    }
+  }
+}

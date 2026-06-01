@@ -1,0 +1,133 @@
+# Production stack — runs on the Hostinger KVM2 VPS alongside the staging stack.
+# Start with: docker compose -f docker/docker-compose.prod.yml --env-file .env.production up -d
+
+name: pbf-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pbf_prod}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-pbf_prod}
+    volumes:
+      - pbf_prod_pg_data:/var/lib/postgresql/data
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+    networks: [pbf-prod-net]
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'pg_isready -U ${POSTGRES_USER:-pbf_prod} -d ${POSTGRES_DB:-pbf_prod}',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.app
+    restart: unless-stopped
+    env_file: ../.env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Bind mount onto host /var/pbf/storage so Nginx (outside Docker) serves
+      # the same bytes the app writes. `location /storage/ { alias /var/pbf/storage/; ... }`
+      # in docker/nginx/printbyfalcon.com.conf reads straight from the host path.
+      - /var/pbf/storage:/storage
+    ports:
+      - '127.0.0.1:3000:3000'
+    networks: [pbf-prod-net]
+    # Run migrations + seed before serving. Use exec form (array) so the YAML
+    # folded-scalar `>` doesn't strip quotes around the `sh -c "..."` argument.
+    command:
+      - 'sh'
+      - '-c'
+      - 'node node_modules/prisma/build/index.js db push --skip-generate --accept-data-loss && node node_modules/tsx/dist/cli.mjs scripts/post-push.ts && node node_modules/tsx/dist/cli.mjs prisma/seed.ts && exec node server.js'
+    # NOTE: using `db push` (schema sync) instead of `migrate deploy` for Sprint 1 —
+    # we have no migration files yet. Switch to `migrate deploy` once we generate
+    # an initial migration in Sprint 2 when the catalog tables stabilize.
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    env_file: ../.env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /var/pbf/storage:/storage
+    networks: [pbf-prod-net]
+
+  # Valkey (Redis-compatible) — required by GlitchTip v6+ for caching & rate limiting.
+  # Per ADR-026: scoped to GlitchTip only; the Print By Falcon app stack still uses
+  # pg-boss + DB sessions (ADR-010 unchanged).
+  valkey:
+    image: valkey/valkey:7-alpine
+    restart: unless-stopped
+    command: ['valkey-server', '--save', '', '--appendonly', 'no']
+    volumes:
+      - pbf_prod_valkey_data:/data
+    networks: [pbf-prod-net]
+    healthcheck:
+      test: ['CMD', 'valkey-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  glitchtip:
+    image: glitchtip/glitchtip:latest
+    restart: unless-stopped
+    # NOTE: deliberately NO env_file here. The PBF app's .env.production contains
+    # APP_URL=https://printbyfalcon.com which would hijack GlitchTip's DSN domain
+    # (events would route to the Next.js app instead of GlitchTip). All required
+    # vars are set explicitly below.
+    environment:
+      DATABASE_URL: ${GLITCHTIP_DATABASE_URL}
+      SECRET_KEY: ${GLITCHTIP_SECRET_KEY}
+      PORT: 8080
+      EMAIL_URL: ${GLITCHTIP_EMAIL_URL:-consolemail://}
+      DEFAULT_FROM_EMAIL: ${GLITCHTIP_FROM_EMAIL:-errors@printbyfalcon.com}
+      # GlitchTip uses GLITCHTIP_DOMAIN to compute the DSN domain shown in the UI
+      # AND for ALLOWED_HOSTS/CSRF settings.
+      GLITCHTIP_DOMAIN: https://errors.printbyfalcon.com
+      # Valkey-backed cache + queue (GlitchTip v6+ hard requirement)
+      REDIS_URL: redis://valkey:6379/0
+      VALKEY_URL: redis://valkey:6379/0
+      # Python logging requires uppercase
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:8080:8080'
+    networks: [pbf-prod-net]
+    # Run migrations on every boot — GlitchTip image doesn't auto-migrate web-only.
+    command: >
+      sh -c "./manage.py migrate --noinput && exec ./bin/start.sh"
+
+  # Note: GlitchTip's celery-beat worker is intentionally not deployed in MVP —
+  # error ingestion + display works web-only. Email digests + cleanup tasks are
+  # nice-to-have; revisit at M2 if needed (would add ~200MB RAM).
+
+volumes:
+  pbf_prod_pg_data:
+  pbf_prod_valkey_data:
+  # Note: pbf_prod_storage was a named volume in Sprint 1; Sprint 2 switched to
+  # a /var/pbf/storage bind mount so Nginx on the host serves the same bytes
+  # (see `app`/`worker` volumes block above).
+
+networks:
+  pbf-prod-net:
+    driver: bridge

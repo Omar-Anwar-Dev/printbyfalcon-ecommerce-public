@@ -1,0 +1,61 @@
+# deps
+node_modules
+.pnp
+.pnp.js
+
+# next
+.next/
+out/
+
+# build artifacts
+dist/
+worker/dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# env
+.env
+.env*.local
+.env.production
+.env.staging
+
+# keep examples
+!.env.example
+!.env.production.example
+!.env.staging.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# Prisma
+prisma/*.db
+prisma/migrations/**/*.sql.bak
+
+# runtime storage (product images, invoices) — anchor to repo root so app/storage/ (route) isn't ignored
+/storage/
+!/storage/.gitkeep
+
+# backups (anchored to repo root)
+/backups/
+!/backups/.gitkeep
+
+# Claude Code worktrees (local agent state, not for version control)
+.claude/worktrees/
+
+# test output
+coverage/
+.nyc_output/
+tmp/
+
+# perf-audit reports (Sprint 11)
+scripts/perf/reports/
